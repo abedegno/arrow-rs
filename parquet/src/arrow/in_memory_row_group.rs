@@ -10,6 +10,7 @@ use crate::errors::ParquetError;
 use crate::file::metadata::page_index::RowGroupPageIndex;
 use crate::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use crate::file::page_index::offset_index::PageLocation;
+use crate::file::properties::ReaderProperties;
 use crate::file::reader::{ChunkReader, Length, SerializedPageReader};
 use bytes::{Buf, Bytes};
 use std::ops::Range;
@@ -295,16 +296,14 @@ impl RowGroups for InMemoryRowGroup<'_> {
                 "Invalid column index {i}, column was not fetched"
             ))),
             Some(data) => {
-                let page_locations = self
-                    .page_index
-                    .as_ref()
-                    .and_then(|pi| pi.page_locations(i).cloned());
                 let column_chunk_metadata = self.metadata.row_group(self.row_group_idx).column(i);
-                let page_reader = SerializedPageReader::new(
+                let page_reader = SerializedPageReader::new_with_page_index(
                     data.clone(),
                     column_chunk_metadata,
                     self.row_count,
-                    page_locations,
+                    self.page_index.as_ref(),
+                    i,
+                    Arc::new(ReaderProperties::builder().build()),
                 )?;
                 let page_reader = page_reader.add_crypto_context(
                     self.row_group_idx,
