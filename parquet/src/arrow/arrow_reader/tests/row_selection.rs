@@ -344,3 +344,115 @@ fn test_list_selection_fuzz() {
         }
     }
 }
+
+/// Skips that cover many whole pages, with and without an offset index, must give the
+/// rows a full read gives. The row count is not a multiple of the page size, so the last
+/// page is short, and the dictionary column starts with a dictionary page.
+#[test]
+#[cfg_attr(miri, ignore)] // Takes too long
+fn test_row_selection_skips_many_pages() {
+    const ROWS: usize = 10_007;
+    const PAGE_ROWS: usize = 64;
+
+    let ids = Int64Array::from_iter_values(0..ROWS as i64);
+    let strings: StringArray = (0..ROWS)
+        .map(|i| (i % 7 != 0).then(|| format!("v{}", i % 13)))
+        .collect();
+    let mut lists = ListBuilder::new(Int32Builder::new());
+    for i in 0..ROWS {
+        if i % 11 == 0 {
+            lists.append_null();
+        } else {
+            for j in 0..i % 4 {
+                lists.values().append_value((i + j) as i32);
+            }
+            lists.append(true);
+        }
+    }
+    let data = RecordBatch::try_from_iter([
+        ("id", Arc::new(ids) as ArrayRef),
+        ("s", Arc::new(strings) as ArrayRef),
+        ("l", Arc::new(lists.finish()) as ArrayRef),
+    ])
+    .unwrap();
+
+    let write = |offset_index_disabled: bool| {
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(PAGE_ROWS)
+            .set_write_batch_size(PAGE_ROWS)
+            .set_offset_index_disabled(offset_index_disabled)
+            .build();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, data.schema(), Some(props)).unwrap();
+        writer.write(&data).unwrap();
+        writer.close().unwrap();
+        Bytes::from(buf)
+    };
+    let with_index = write(false);
+    let without_index = write(true);
+
+    let last_page = (ROWS - 1) / PAGE_ROWS * PAGE_ROWS;
+    let mut selections = vec![
+        vec![RowSelector::skip(ROWS - 1), RowSelector::select(1)],
+        vec![
+            RowSelector::skip(last_page),
+            RowSelector::select(ROWS - last_page),
+        ],
+        vec![
+            RowSelector::skip(last_page - 1),
+            RowSelector::select(ROWS - last_page + 1),
+        ],
+        vec![RowSelector::skip(ROWS)],
+        vec![
+            RowSelector::select(1),
+            RowSelector::skip(10 * PAGE_ROWS - 1),
+            RowSelector::select(PAGE_ROWS),
+            RowSelector::skip(ROWS - 11 * PAGE_ROWS),
+        ],
+    ];
+    let mut rng = StdRng::seed_from_u64(42);
+    for _ in 0..20 {
+        let mut selection = vec![];
+        let mut remaining = ROWS;
+        let mut skip = rng.random_bool(0.5);
+        while remaining > 0 {
+            let len = rng.random_range(1..=(8 * PAGE_ROWS).min(remaining));
+            selection.push(RowSelector {
+                row_count: len,
+                skip,
+            });
+            remaining -= len;
+            skip = !skip;
+        }
+        selections.push(selection);
+    }
+
+    for selectors in selections {
+        let selection = RowSelection::from(selectors.clone());
+        let mask: BooleanArray = selectors
+            .iter()
+            .flat_map(|s| std::iter::repeat_n(Some(!s.skip), s.row_count))
+            .collect();
+        let expected = arrow_select::filter::filter_record_batch(&data, &mask).unwrap();
+        for (file, policy) in [
+            (&with_index, PageIndexPolicy::Required),
+            (&without_index, PageIndexPolicy::Skip),
+        ] {
+            let options = ArrowReaderOptions::new().with_page_index_policy(policy);
+            let batches =
+                ParquetRecordBatchReaderBuilder::try_new_with_options(file.clone(), options)
+                    .unwrap()
+                    .with_batch_size(1024)
+                    .with_row_selection(selection.clone())
+                    .with_row_selection_policy(
+                        crate::arrow::arrow_reader::RowSelectionPolicy::Selectors,
+                    )
+                    .build()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+            let actual = concat_batches(&data.schema(), &batches).unwrap();
+            assert_eq!(actual, expected, "{policy:?}, {selectors:?}");
+        }
+    }
+}

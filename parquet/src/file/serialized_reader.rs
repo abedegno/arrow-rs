@@ -1225,6 +1225,47 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
         Ok(())
     }
 
+    fn skip_pages_within(&mut self, max_rows: usize) -> Result<usize> {
+        let SerializedPageReaderState::Pages {
+            page_locations,
+            dictionary_page: None,
+            total_rows,
+            page_index,
+        } = &mut self.state
+        else {
+            return Ok(0);
+        };
+        let Some(first) = page_locations.front() else {
+            return Ok(0);
+        };
+        let start_row = first.first_row_index as usize;
+        let limit = start_row.saturating_add(max_rows);
+        // Page `i` ends where page `i + 1` starts and the last page ends at `total_rows`.
+        let first_end = page_locations
+            .get(1)
+            .map_or(*total_rows, |next| next.first_row_index as usize);
+        if first_end > limit {
+            return Ok(0);
+        }
+        // Every page before the last one starting at or before `limit` fits
+        let starting = page_locations.partition_point(|p| p.first_row_index as usize <= limit);
+        let pages = if starting == page_locations.len() && *total_rows <= limit {
+            starting
+        } else {
+            starting.saturating_sub(1)
+        };
+        let end_row = match page_locations.get(pages) {
+            Some(next) => next.first_row_index as usize,
+            None => *total_rows,
+        };
+        let rows = end_row.checked_sub(start_row).ok_or_else(|| {
+            general_err!("offset index first_row_index values are not increasing")
+        })?;
+        page_locations.drain(..pages);
+        *page_index += pages;
+        Ok(rows)
+    }
+
     fn supports_deferred_dictionary(&self) -> bool {
         match &self.state {
             // Walking headers identifies dictionaries independently of metadata.
@@ -3449,5 +3490,92 @@ mod tests {
         let (records, _, _) = reader.read_records(3, None, None, &mut values).unwrap();
         assert_eq!(records, 3);
         assert_eq!(values, vec![3, 4, 5]);
+    }
+
+    /// A page reader over synthetic page locations. `skip_pages_within` reads only the
+    /// locations, so the pages they point at do not need to exist.
+    fn located_reader(
+        first_rows: &[i64],
+        total_rows: usize,
+        with_dictionary: bool,
+    ) -> SerializedPageReader<Bytes> {
+        let (bytes, _) = dict_column_file();
+        let reader = SerializedFileReader::new(bytes.clone()).unwrap();
+        let meta = reader.metadata().row_group(0).column(0).clone();
+        let start = meta.byte_range().0 as i64;
+        let first = if with_dictionary { start + 1 } else { start };
+        let locations = first_rows
+            .iter()
+            .enumerate()
+            .map(|(i, &first_row_index)| PageLocation {
+                offset: first + i as i64,
+                compressed_page_size: 1,
+                first_row_index,
+            })
+            .collect();
+        SerializedPageReader::new(Arc::new(bytes), &meta, total_rows, Some(locations)).unwrap()
+    }
+
+    #[test]
+    fn skip_pages_within_matches_skipping_page_by_page() {
+        // Includes a page of zero rows
+        let first_rows = [0, 7, 7, 20, 21, 50, 64];
+        let total_rows = 70;
+        for start in 0..first_rows.len() {
+            for max_rows in 0..=total_rows + 1 {
+                let mut bulk = located_reader(&first_rows, total_rows, false);
+                let mut single = located_reader(&first_rows, total_rows, false);
+                for _ in 0..start {
+                    bulk.skip_next_page().unwrap();
+                    single.skip_next_page().unwrap();
+                }
+                let mut expected = 0;
+                while let Some(PageMetadata {
+                    num_rows: Some(rows),
+                    ..
+                }) = single.peek_next_page().unwrap()
+                {
+                    if expected + rows > max_rows {
+                        break;
+                    }
+                    single.skip_next_page().unwrap();
+                    expected += rows;
+                }
+                assert_eq!(
+                    bulk.skip_pages_within(max_rows).unwrap(),
+                    expected,
+                    "start {start}, max_rows {max_rows}"
+                );
+                assert_eq!(
+                    bulk.peek_next_page_offset().unwrap(),
+                    single.peek_next_page_offset().unwrap(),
+                    "start {start}, max_rows {max_rows}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn skip_pages_within_stops_at_a_dictionary_page() {
+        let mut pages = located_reader(&[0, 10], 20, true);
+        assert_eq!(pages.skip_pages_within(20).unwrap(), 0);
+        pages.skip_next_page().unwrap();
+        assert_eq!(pages.skip_pages_within(20).unwrap(), 20);
+    }
+
+    #[test]
+    fn skip_pages_within_without_page_locations_skips_nothing() {
+        let (bytes, _) = dict_column_file();
+        let reader = SerializedFileReader::new(bytes.clone()).unwrap();
+        let meta = reader.metadata().row_group(0).column(0).clone();
+        let mut pages = SerializedPageReader::new(Arc::new(bytes), &meta, 5, None).unwrap();
+        assert_eq!(pages.skip_pages_within(5).unwrap(), 0);
+    }
+
+    #[test]
+    fn skip_pages_within_rejects_decreasing_first_row_index() {
+        let mut pages = located_reader(&[10, 0], 5, false);
+        let err = pages.skip_pages_within(100).unwrap_err();
+        assert!(err.to_string().contains("not increasing"), "{err}");
     }
 }

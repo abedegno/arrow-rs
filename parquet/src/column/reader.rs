@@ -313,6 +313,11 @@ where
         let mut remaining_records = num_records;
         while remaining_records != 0 {
             if self.num_buffered_values == self.num_decoded_values {
+                remaining_records -= self.page_reader.skip_pages_within(remaining_records)?;
+                if remaining_records == 0 {
+                    break;
+                }
+
                 let Some(metadata) = self.page_reader.peek_next_page()? else {
                     return Ok(num_records - remaining_records);
                 };
