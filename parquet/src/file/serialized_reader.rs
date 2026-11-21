@@ -12,7 +12,7 @@ use crate::compression::{Codec, create_codec};
 #[cfg(feature = "encryption")]
 use crate::encryption::decrypt::{CryptoContext, read_and_decrypt};
 use crate::errors::{ParquetError, Result};
-use crate::file::metadata::page_index::RowGroupPageIndex;
+use crate::file::metadata::page_index::{PageIndexProvider, RowGroupPageIndex};
 use crate::file::metadata::thrift::PageHeader;
 use crate::file::page_index::offset_index::PageLocation;
 use crate::file::statistics;
@@ -28,7 +28,6 @@ use crate::record::Row;
 use crate::record::reader::RowIter;
 use crate::schema::types::{SchemaDescPtr, Type as SchemaType};
 use bytes::Bytes;
-use std::collections::VecDeque;
 use std::{fs::File, io::Read, path::Path, sync::Arc};
 
 impl TryFrom<File> for SerializedFileReader<File> {
@@ -362,15 +361,13 @@ impl<R: 'static + ChunkReader> RowGroupReader for SerializedRowGroupReader<'_, R
     fn get_column_page_reader(&self, i: usize) -> Result<Box<dyn PageReader>> {
         let col = self.metadata.column(i);
 
-        // TODO(ets): push page index into page reader so we don't have to clone here
-        let page_locations = self.page_index.page_locations(i).cloned();
-
         let props = Arc::clone(&self.props);
-        Ok(Box::new(SerializedPageReader::new_with_properties(
+        Ok(Box::new(SerializedPageReader::new_with_page_index(
             Arc::clone(&self.chunk_reader),
             col,
             usize::try_from(self.metadata.num_rows())?,
-            page_locations,
+            Some(&self.page_index),
+            i,
             props,
         )?))
     }
@@ -573,15 +570,58 @@ enum SerializedPageReaderState {
         require_dictionary: bool,
     },
     Pages {
-        /// Remaining page locations
-        page_locations: VecDeque<PageLocation>,
+        /// The page locations of the chunk
+        page_locations: PageLocations,
+        /// The location of the next data page and the row where it ends, kept so that
+        /// peeking at the next page does not look the locations up again
+        next: Option<(PageLocation, usize)>,
         /// Remaining dictionary location if any
         dictionary_page: Option<PageLocation>,
         /// The total number of rows in this column chunk
         total_rows: usize,
-        /// The index of the data page within this column chunk
+        /// The index of the next data page within this column chunk, also its index in
+        /// `page_locations`
         page_index: usize,
     },
+}
+
+/// The page locations of one column chunk, owned or read in place from a page index.
+enum PageLocations {
+    Owned(Vec<PageLocation>),
+    Shared {
+        page_index: Arc<dyn PageIndexProvider>,
+        row_group: usize,
+        column: usize,
+    },
+}
+
+impl PageLocations {
+    fn as_slice(&self) -> &[PageLocation] {
+        match self {
+            Self::Owned(locations) => locations,
+            Self::Shared {
+                page_index,
+                row_group,
+                column,
+            } => page_index
+                .page_locations(*row_group, *column)
+                .map_or(&[], |locations| locations.as_slice()),
+        }
+    }
+}
+
+/// The location of page `i` in `locations` and the row where that page ends: the first row of
+/// the page after it, or `total_rows` for the last page.
+fn page_and_end(
+    locations: &[PageLocation],
+    i: usize,
+    total_rows: usize,
+) -> Option<(PageLocation, usize)> {
+    let page = locations.get(i)?.clone();
+    let end = locations
+        .get(i + 1)
+        .map_or(total_rows, |next| next.first_row_index as usize);
+    Some((page, end))
 }
 
 #[derive(Default)]
@@ -672,6 +712,40 @@ impl<R: ChunkReader> SerializedPageReader<R> {
         page_locations: Option<Vec<PageLocation>>,
         props: ReaderPropertiesPtr,
     ) -> Result<Self> {
+        let page_locations = page_locations.map(PageLocations::Owned);
+        Self::new_with_locations(reader, meta, total_rows, page_locations, props)
+    }
+
+    /// Like [`Self::new_with_properties`], with the page locations of column `column` read
+    /// in place from `page_index` instead of copied.
+    pub(crate) fn new_with_page_index(
+        reader: Arc<R>,
+        meta: &ColumnChunkMetaData,
+        total_rows: usize,
+        page_index: Option<&RowGroupPageIndex>,
+        column: usize,
+        props: ReaderPropertiesPtr,
+    ) -> Result<Self> {
+        let page_locations = page_index.and_then(|index| {
+            let provider = index.provider()?;
+            let row_group = index.row_group_idx();
+            provider.page_locations(row_group, column)?;
+            Some(PageLocations::Shared {
+                page_index: Arc::clone(provider),
+                row_group,
+                column,
+            })
+        });
+        Self::new_with_locations(reader, meta, total_rows, page_locations, props)
+    }
+
+    fn new_with_locations(
+        reader: Arc<R>,
+        meta: &ColumnChunkMetaData,
+        total_rows: usize,
+        page_locations: Option<PageLocations>,
+        props: ReaderPropertiesPtr,
+    ) -> Result<Self> {
         let decompressor = create_codec(meta.compression(), props.codec_options())?;
         let (start, len) = meta.byte_range();
 
@@ -679,7 +753,7 @@ impl<R: ChunkReader> SerializedPageReader<R> {
             Some(locations) => {
                 // If the offset of the first page doesn't match the start of the column chunk
                 // then the preceding space must contain a dictionary page.
-                let dictionary_page = match locations.first() {
+                let dictionary_page = match locations.as_slice().first() {
                     Some(dict_offset) if dict_offset.offset as u64 != start => Some(PageLocation {
                         offset: start as i64,
                         compressed_page_size: (dict_offset.offset as u64 - start) as i32,
@@ -688,8 +762,10 @@ impl<R: ChunkReader> SerializedPageReader<R> {
                     _ => None,
                 };
 
+                let next = page_and_end(locations.as_slice(), 0, total_rows);
                 SerializedPageReaderState::Pages {
-                    page_locations: locations.into(),
+                    page_locations: locations,
+                    next,
                     dictionary_page,
                     total_rows,
                     page_index: 0,
@@ -766,13 +842,13 @@ impl<R: ChunkReader> SerializedPageReader<R> {
                 }
             }
             SerializedPageReaderState::Pages {
-                page_locations,
+                next,
                 dictionary_page,
                 ..
             } => {
                 if let Some(page) = dictionary_page {
                     Ok(Some(page.offset as u64))
-                } else if let Some(page) = page_locations.front() {
+                } else if let Some((page, _)) = next {
                     Ok(Some(page.offset as u64))
                 } else {
                     Ok(None)
@@ -1025,14 +1101,15 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                 }
                 SerializedPageReaderState::Pages {
                     page_locations,
+                    next,
                     dictionary_page,
+                    total_rows,
                     page_index,
-                    ..
                 } => {
                     let (front, is_dictionary_page) = match dictionary_page.take() {
                         Some(front) => (front, true),
-                        None => match page_locations.pop_front() {
-                            Some(front) => (front, false),
+                        None => match next {
+                            Some((front, _)) => (front.clone(), false),
                             None => return Ok(None),
                         },
                     };
@@ -1052,7 +1129,9 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                             .decrypt_page_data(bytes, *page_index, is_dictionary_page)?;
 
                     if !is_dictionary_page {
+                        // Move on only once the page has been read, so a failed read can be retried
                         *page_index += 1;
+                        *next = page_and_end(page_locations.as_slice(), *page_index, *total_rows);
                     }
                     decode_page(
                         header,
@@ -1111,10 +1190,9 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                 }
             }
             SerializedPageReaderState::Pages {
-                page_locations,
+                next,
                 dictionary_page,
-                total_rows,
-                page_index: _,
+                ..
             } => {
                 if dictionary_page.is_some() {
                     Ok(Some(PageMetadata {
@@ -1122,14 +1200,9 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         num_levels: None,
                         is_dict: true,
                     }))
-                } else if let Some(page) = page_locations.front() {
-                    let next_rows = page_locations
-                        .get(1)
-                        .map(|x| x.first_row_index as usize)
-                        .unwrap_or(*total_rows);
-
+                } else if let Some((page, end)) = next {
                     Ok(Some(PageMetadata {
-                        num_rows: Some(next_rows - page.first_row_index as usize),
+                        num_rows: Some(*end - page.first_row_index as usize),
                         num_levels: None,
                         is_dict: false,
                     }))
@@ -1203,17 +1276,19 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
             }
             SerializedPageReaderState::Pages {
                 page_locations,
+                next,
                 dictionary_page,
+                total_rows,
                 page_index,
-                ..
             } => {
                 if dictionary_page.is_some() {
                     // Consume the dictionary page, keeping its location.
                     dictionary_page.take().map(DeferredDictionaryPage::Location)
                 } else {
-                    // If no dictionary page exists, simply pop the data page from page_locations
-                    if page_locations.pop_front().is_some() {
+                    // If no dictionary page exists, step over the data page
+                    if next.is_some() {
                         *page_index += 1;
+                        *next = page_and_end(page_locations.as_slice(), *page_index, *total_rows);
                     }
                     None
                 }
@@ -1228,6 +1303,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
     fn skip_pages_within(&mut self, max_rows: usize) -> Result<usize> {
         let SerializedPageReaderState::Pages {
             page_locations,
+            next,
             dictionary_page: None,
             total_rows,
             page_index,
@@ -1235,16 +1311,19 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
         else {
             return Ok(0);
         };
-        let Some(first) = page_locations.front() else {
+        let Some((first, first_end)) = next else {
             return Ok(0);
         };
         let start_row = first.first_row_index as usize;
         let limit = start_row.saturating_add(max_rows);
-        // Page `i` ends where page `i + 1` starts and the last page ends at `total_rows`.
-        let first_end = page_locations
-            .get(1)
-            .map_or(*total_rows, |next| next.first_row_index as usize);
-        if first_end > limit {
+        // The next page alone does not fit: nothing to skip, and no lookup needed.
+        if *first_end > limit {
+            return Ok(0);
+        }
+        let all_locations = page_locations.as_slice();
+        let page_locations = all_locations.get(*page_index..).unwrap_or_default();
+        if page_locations.is_empty() {
+            // Only if the page index no longer has the locations `next` came from
             return Ok(0);
         }
         // Every page before the last one starting at or before `limit` fits
@@ -1261,8 +1340,8 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
         let rows = end_row.checked_sub(start_row).ok_or_else(|| {
             general_err!("offset index first_row_index values are not increasing")
         })?;
-        page_locations.drain(..pages);
         *page_index += pages;
+        *next = page_and_end(all_locations, *page_index, *total_rows);
         Ok(rows)
     }
 
@@ -1921,6 +2000,128 @@ mod tests {
     }
 
     #[test]
+    fn shared_page_locations_read_the_same_pages_as_owned_ones() -> Result<()> {
+        let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
+        let options = ReadOptionsBuilder::new().with_page_index().build();
+        let reader = SerializedFileReader::new_with_options(test_file, options)?;
+        let metadata = reader.metadata();
+        let page_index = metadata.page_index_for_row_group(0);
+        let total_rows = metadata.row_group(0).num_rows() as usize;
+        for column in 0..metadata.row_group(0).num_columns() {
+            let mut owned = get_serialized_page_reader(&reader, 0, column)?;
+            let mut shared = SerializedPageReader::new_with_page_index(
+                Arc::clone(&reader.chunk_reader),
+                metadata.row_group(0).column(column),
+                total_rows,
+                Some(&page_index),
+                column,
+                Arc::clone(&reader.props),
+            )?;
+            assert!(matches!(
+                &shared.state,
+                SerializedPageReaderState::Pages {
+                    page_locations: PageLocations::Shared { .. },
+                    ..
+                }
+            ));
+            let mut pages = 0;
+            while let Some(page) = owned.get_next_page()? {
+                let other = shared.get_next_page()?.unwrap();
+                assert_eq!(page.page_type(), other.page_type());
+                assert_eq!(page.num_values(), other.num_values());
+                assert_eq!(page.buffer(), other.buffer());
+                pages += 1;
+            }
+            assert!(shared.get_next_page()?.is_none());
+            assert!(pages > 1, "column {column} has {pages} pages");
+        }
+
+        // Without an offset index for the chunk, the reader walks the page headers
+        let none = RowGroupPageIndex::new(0, None);
+        let pages = SerializedPageReader::new_with_page_index(
+            Arc::clone(&reader.chunk_reader),
+            metadata.row_group(0).column(0),
+            total_rows,
+            Some(&none),
+            0,
+            Arc::clone(&reader.props),
+        )?;
+        assert!(matches!(
+            pages.state,
+            SerializedPageReaderState::Values { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_page_read_keeps_the_position() {
+        // The located pages are one byte long, so reading one fails.
+        let mut pages = located_reader(&[0, 10, 20], 30, false);
+        let before = pages.peek_next_page_offset().unwrap();
+        assert!(pages.get_next_page().is_err());
+        assert_eq!(pages.peek_next_page_offset().unwrap(), before);
+        assert_eq!(pages.peek_next_page().unwrap().unwrap().num_rows, Some(10));
+    }
+
+    #[test]
+    fn skip_pages_within_stays_within_max_rows_if_the_provider_drops_the_locations() {
+        use crate::file::page_index::{
+            column_index::ColumnIndexMetaData, offset_index::OffsetIndexMetaData,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Forwards to another provider until `gone` is set, then has no offset index.
+        #[derive(Debug)]
+        struct Dropping {
+            inner: Arc<dyn PageIndexProvider>,
+            gone: AtomicBool,
+        }
+        impl PageIndexProvider for Dropping {
+            fn has_offset_indexes(&self) -> bool {
+                self.inner.has_offset_indexes()
+            }
+            fn has_column_indexes(&self) -> bool {
+                self.inner.has_column_indexes()
+            }
+            fn column_index(&self, rg: usize, col: usize) -> Option<&ColumnIndexMetaData> {
+                self.inner.column_index(rg, col)
+            }
+            fn offset_index(&self, rg: usize, col: usize) -> Option<&OffsetIndexMetaData> {
+                if self.gone.load(Ordering::Relaxed) {
+                    None
+                } else {
+                    self.inner.offset_index(rg, col)
+                }
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
+        let options = ReadOptionsBuilder::new().with_page_index().build();
+        let reader = SerializedFileReader::new_with_options(test_file, options).unwrap();
+        let metadata = reader.metadata();
+        let provider = Arc::new(Dropping {
+            inner: Arc::clone(metadata.page_index().unwrap()),
+            gone: AtomicBool::new(false),
+        });
+        let index = RowGroupPageIndex::new(0, Some(provider.clone() as Arc<dyn PageIndexProvider>));
+        let mut pages = SerializedPageReader::new_with_page_index(
+            Arc::clone(&reader.chunk_reader),
+            metadata.row_group(0).column(0),
+            metadata.row_group(0).num_rows() as usize,
+            Some(&index),
+            0,
+            Arc::clone(&reader.props),
+        )
+        .unwrap();
+        let first = pages.peek_next_page().unwrap().unwrap().num_rows.unwrap();
+        provider.gone.store(true, Ordering::Relaxed);
+        assert!(pages.skip_pages_within(first).unwrap() <= first);
+    }
+
+    #[test]
     fn test_peek_next_page_offset_matches_actual() -> Result<()> {
         let test_file = get_test_file("alltypes_plain.parquet");
         let reader = SerializedFileReader::new(test_file)?;
@@ -1937,11 +2138,12 @@ mod tests {
                         SerializedPageReaderState::Pages {
                             page_locations,
                             dictionary_page,
+                            page_index,
                             ..
                         } => {
                             if let Some(page) = dictionary_page {
                                 assert_eq!(page.offset as u64, page_offset);
-                            } else if let Some(page) = page_locations.front() {
+                            } else if let Some(page) = page_locations.as_slice().get(*page_index) {
                                 assert_eq!(page.offset as u64, page_offset);
                             } else {
                                 unreachable!()

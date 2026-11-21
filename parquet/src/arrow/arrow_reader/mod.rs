@@ -32,6 +32,7 @@ use crate::file::metadata::{
     ColumnChunkMask, PageIndexPolicy, ParquetMetaData, ParquetMetaDataOptions,
     ParquetMetaDataReader, ParquetStatisticsPolicy, RowGroupMetaData,
 };
+use crate::file::properties::ReaderProperties;
 use crate::file::reader::{ChunkReader, SerializedPageReader};
 use crate::schema::types::SchemaDescriptor;
 
@@ -1471,21 +1472,24 @@ impl<T: ChunkReader + 'static> ReaderPageIterator<T> {
     fn next_page_reader(&self, rg_idx: usize) -> Result<SerializedPageReader<T>> {
         let rg = self.metadata.row_group(rg_idx);
         let column_chunk_metadata = rg.column(self.column_idx);
-        let page_locations = self
-            .metadata
-            .page_index()
-            .map(|i| i.page_locations(rg_idx, self.column_idx).cloned())
-            .unwrap_or(None);
+        let page_index = self.metadata.page_index_for_row_group(rg_idx);
         let total_rows = rg.num_rows() as usize;
         let reader = self.reader.clone();
 
-        SerializedPageReader::new(reader, column_chunk_metadata, total_rows, page_locations)?
-            .add_crypto_context(
-                rg_idx,
-                self.column_idx,
-                self.metadata.as_ref(),
-                column_chunk_metadata,
-            )
+        SerializedPageReader::new_with_page_index(
+            reader,
+            column_chunk_metadata,
+            total_rows,
+            Some(&page_index),
+            self.column_idx,
+            Arc::new(ReaderProperties::builder().build()),
+        )?
+        .add_crypto_context(
+            rg_idx,
+            self.column_idx,
+            self.metadata.as_ref(),
+            column_chunk_metadata,
+        )
     }
 }
 

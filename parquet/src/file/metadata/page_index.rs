@@ -284,6 +284,14 @@ impl RowGroupPageIndex {
         }
     }
 
+    pub(crate) fn row_group_idx(&self) -> usize {
+        self.row_group_idx
+    }
+
+    pub(crate) fn provider(&self) -> Option<&Arc<dyn PageIndexProvider>> {
+        self.page_index.as_ref()
+    }
+
     /// Returns the column index for a specific column in this row group
     ///
     /// This is a convenience method that wraps [`PageIndexProvider::column_index`],
