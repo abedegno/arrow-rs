@@ -391,6 +391,19 @@ pub trait PageReader: Iterator<Item = Result<Page>> + Send {
     /// column index information
     fn skip_next_page(&mut self) -> Result<()>;
 
+    /// Skips whole data pages that together hold at most `max_rows` rows, and returns
+    /// the number of rows skipped.
+    ///
+    /// Stops at a dictionary page, at a page whose row count is not known without
+    /// reading it, and at the first page that does not fit. Callers skip the rest page
+    /// by page with [`Self::peek_next_page`] and [`Self::skip_next_page`].
+    ///
+    /// The default implementation skips nothing and returns `Ok(0)`.
+    fn skip_pages_within(&mut self, max_rows: usize) -> Result<usize> {
+        let _ = max_rows;
+        Ok(0)
+    }
+
     /// Returns whether skipped dictionary pages can later be recovered with
     /// [`Self::take_deferred_dictionary`].
     ///

@@ -293,6 +293,11 @@ required-features = ["experimental", "default"]
 harness = false
 
 [[bench]]
+name = "arrow_reader_page_skip"
+required-features = ["arrow"]
+harness = false
+
+[[bench]]
 name = "dictionary_skip"
 required-features = ["default"]
 harness = false
